@@ -8,3 +8,5 @@ edition = "2018"
 
 [dependencies]
 tokio = { version = "0.2", features = ["full"] }
+clap = "2.33.0"
+url = "2.1.1"
