@@ -1,94 +1,118 @@
-extern crate clap;
+#![deny(warnings)]
 
-use clap::{App, Arg};
+use std::convert::Infallible;
 use std::net::SocketAddr;
-use tokio::net::TcpListener;
-use tokio::prelude::*;
-use url::{Host, Url};
 
+use futures_util::future::try_join;
+
+use hyper::service::{make_service_fn, service_fn};
+use hyper::upgrade::Upgraded;
+use hyper::{Body, Client, Method, Request, Response, Server};
+
+use tokio::net::TcpStream;
+
+type HttpClient = Client<hyper::client::HttpConnector>;
+
+// To try this example:
+// 1. cargo run --example http_proxy
+// 2. config http_proxy in command line
+//    $ export http_proxy=http://127.0.0.1:8100
+//    $ export https_proxy=http://127.0.0.1:8100
+// 3. send requests
+//    $ curl -i https://www.some_domain.com/
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let backends: Vec<std::net::SocketAddr> = Vec::new();
+async fn main() {
+    let addr = SocketAddr::from(([127, 0, 0, 1], 8100));
+    let client = HttpClient::new();
 
-    let matches = App::new("My Super Program")
-        .version("1.0")
-        .author("Kevin K. <kbknapp@gmail.com>")
-        .about("Does awesome things")
-        .arg(
-            Arg::with_name("host")
-                .short("h")
-                .long("host")
-                .help("Host to serve the application")
-                .default_value("127.0.0.1")
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("port")
-                .short("p")
-                .long("port")
-                .help("Port to serve the application")
-                .default_value("9091")
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("backends")
-                .long("backends")
-                .help("Backends for application")
-                .takes_value(true)
-                .required(true),
-        )
-        .get_matches();
+    let make_service = make_service_fn(move |_| {
+        let client = client.clone();
+        async move { Ok::<_, Infallible>(service_fn(move |req| proxy(client.clone(), req))) }
+    });
 
-    let net_interface = format!(
-        "{}:{}",
-        matches.value_of("host").unwrap_or_default(),
-        matches.value_of("port").unwrap_or_default()
-    );
-    let mut listener = TcpListener::bind(&net_interface).await?;
+    let server = Server::bind(&addr).serve(make_service);
 
-    println!("Parsing backends");
-    let urls: Vec<&str> = matches
-        .value_of("backends")
-        .unwrap_or("")
-        .split(",")
-        .collect();
-    for url in urls {
-        let v = match Url::parse(url) {
-            Ok(v) => v,
-            Err(err) => {
-                eprintln!("Error parsing {}, {}", url, err);
-                std::process::exit(1)
-            }
-        };
-        println!("Parsed {:?}", v);
-        // let s_addr = format!("{}:{}", Host::Domain(v.host()), v.port());
+    println!("Listening on http://{}", addr);
+
+    if let Err(e) = server.await {
+        eprintln!("server error: {}", e);
     }
+}
 
-    println!("Starting application at {}", &net_interface);
-    loop {
-        let (mut socket, _) = listener.accept().await?;
+async fn proxy(client: HttpClient, req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
+    println!("req: {:?}", req);
 
-        tokio::spawn(async move {
-            let mut buf = [0; 1024];
-
-            // In a loop, read data from the socket and write the data back.
-            loop {
-                let n = match socket.read(&mut buf).await {
-                    // socket closed
-                    Ok(n) if n == 0 => return,
-                    Ok(n) => n,
-                    Err(e) => {
-                        eprintln!("failed to read from socket; err = {:?}", e);
-                        return;
+    if Method::CONNECT == req.method() {
+        // Received an HTTP request like:
+        // ```
+        // CONNECT www.domain.com:443 HTTP/1.1
+        // Host: www.domain.com:443
+        // Proxy-Connection: Keep-Alive
+        // ```
+        //
+        // When HTTP method is CONNECT we should return an empty body
+        // then we can eventually upgrade the connection and talk a new protocol.
+        //
+        // Note: only after client received an empty body with STATUS_OK can the
+        // connection be upgraded, so we can't return a response inside
+        // `on_upgrade` future.
+        if let Some(addr) = host_addr(req.uri()) {
+            tokio::task::spawn(async move {
+                match req.into_body().on_upgrade().await {
+                    Ok(upgraded) => {
+                        if let Err(e) = tunnel(upgraded, addr).await {
+                            eprintln!("server io error: {}", e);
+                        };
                     }
-                };
-
-                // Write the data back
-                if let Err(e) = socket.write_all(&buf[0..n]).await {
-                    eprintln!("failed to write to socket; err = {:?}", e);
-                    return;
+                    Err(e) => eprintln!("upgrade error: {}", e),
                 }
-            }
-        });
+            });
+
+            Ok(Response::new(Body::empty()))
+        } else {
+            eprintln!("CONNECT host is not socket addr: {:?}", req.uri());
+            let mut resp = Response::new(Body::from("CONNECT must be to a socket address"));
+            *resp.status_mut() = http::StatusCode::BAD_REQUEST;
+
+            Ok(resp)
+        }
+    } else {
+        client.request(req).await
     }
+}
+
+fn host_addr(uri: &http::Uri) -> Option<SocketAddr> {
+    uri.authority().and_then(|auth| auth.as_str().parse().ok())
+}
+
+// Create a TCP connection to host:port, build a tunnel between the connection and
+// the upgraded connection
+async fn tunnel(upgraded: Upgraded, addr: SocketAddr) -> std::io::Result<()> {
+    // Connect to remote server
+    let mut server = TcpStream::connect(addr).await?;
+
+    // Proxying data
+    let amounts = {
+        let (mut server_rd, mut server_wr) = server.split();
+        let (mut client_rd, mut client_wr) = tokio::io::split(upgraded);
+
+        let client_to_server = tokio::io::copy(&mut client_rd, &mut server_wr);
+        let server_to_client = tokio::io::copy(&mut server_rd, &mut client_wr);
+
+        try_join(client_to_server, server_to_client).await
+    };
+
+    // Print message when done
+    match amounts {
+        Ok((from_client, from_server)) => {
+            println!(
+                "client wrote {} bytes and received {} bytes",
+                from_client, from_server
+            );
+        }
+        Err(e) => {
+            println!("tunnel error: {}", e);
+        }
+    };
+    Ok(())
 }

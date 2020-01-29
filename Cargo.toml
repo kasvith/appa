@@ -10,3 +10,6 @@ edition = "2018"
 tokio = { version = "0.2", features = ["full"] }
 clap = "2.33.0"
 url = "2.1.1"
+hyper = "0.13"
+futures-util = { version = "0.3", default-features = false }
+http = "0.2.0"
